@@ -1,30 +1,51 @@
+#include <Servo.h>
 #include "Wire.h"
 #include <SPI.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
 #include <Adafruit_MPU6050.h>
-#include <WiFiNINA.h>
-#include <WiFiUdp.h>
 //#include "keys.h"
 #include "I2Cdev.h"
 #include "MPU6050_6Axis_MotionApps20.h"
+#include <RH_RF95.h>
+#include <avr/dtostrf.h>
+
 
 // ------------ Globals
 
+// IMU 
 MPU6050 mpu;
 #define OUTPUT_READABLE_YAWPITCHROLL
 #define INTERRUPT_PIN 6
 
+// LoRa
+#define RFM95_CS 8
+#define RFM95_RST 4
+#define RFM95_INT 3
+
+#define RF95_FREQ 915.0
+
+RH_RF95 rf95(RFM95_CS, RFM95_INT);
+
+// BME
 #define SEALEVELPRESSURE_HPA (1022.6)
 
 Adafruit_BME280 bme; // I2C
 
 int altitude, lastAlt, apogee;
 
+// Buzzer
 unsigned int numTones = 6;
 unsigned int tones[] = {523, 587, 659, 739, 830, 880};
 ////            upper    C    D    E    F#   G#   A
 
+// Servo
+int servo0Pin = 10;
+int servo1Pin = 11;
+Servo servo0;
+Servo servo1;
+
+// Text
 boolean chutesFired = false;
 boolean landed = false;
 
@@ -74,7 +95,9 @@ void setup() {
     #elif I2CDEV_IMPLEMENTATION == I2CDEV_BUILTIN_FASTWIRE
         Fastwire::setup(400, true);
     #endif
-
+  
+  pinMode(RFM95_RST, OUTPUT);
+  digitalWrite(RFM95_RST, HIGH);
     
   Serial.begin(115200);
   for (unsigned int i = 0; i < numTones; i++)
@@ -85,6 +108,28 @@ void setup() {
   noTone(A1);
   delay(2000);  // time to get serial running
   unsigned status;
+
+  // Reset LoRa Module
+  digitalWrite(RFM95_RST, LOW);
+  delay(10);
+  digitalWrite(RFM95_RST, HIGH);
+  delay(10);
+
+  while (!rf95.init()) {
+    Serial.println("LoRa radio init failed");
+    Serial.println("Uncomment '#define SERIAL_DEBUG' in RH_RF95.cpp for detailed debug info");
+    while (1);
+  }
+  Serial.println("LoRa radio init OK!");
+
+  if (!rf95.setFrequency(RF95_FREQ)) {
+    Serial.println("setFrequency failed");
+    while (1);
+  }
+  Serial.print("Set Freq to: "); Serial.println(RF95_FREQ);
+
+
+  rf95.setTxPower(23, false);
  
 
   // default settings
@@ -96,19 +141,27 @@ void setup() {
     while (1) delay(10);
   } else {
     if (status) {
+      Serial.println("Atmospheric Sensor Detected.");
+      analogWrite(A3, 255);
       tone(A1, 523);
       delay(50);
       noTone(A1);
+      analogWrite(A3, 0);
       delay(1000);
     }
   }
   
   mpu.initialize();
   pinMode(INTERRUPT_PIN, INPUT_PULLUP);
+  Serial.println("IMU Detected.");
   tone(A1, 523);
+  analogWrite(A3, 255);
   delay(50);
   noTone(A1);
+  analogWrite(A3, 0);
   delay(1000);
+
+  pinMode(A3, OUTPUT);
 
   devStatus = mpu.dmpInitialize();
 
@@ -151,7 +204,10 @@ void setup() {
         Serial.println(F(")"));
     }
 
-  analogWrite(A0, 150);
+    servo0.attach(servo0Pin);
+    servo1.attach(servo1Pin);
+
+  analogWrite(A3, 255);
   delay(200);
 
   Serial.println("");
@@ -160,14 +216,16 @@ void setup() {
   delay(500);
   noTone(A1);
 
-//  delay(1000);
-//  analogWrite(A0, 150);
+  delay(1000);
+  analogWrite(A3, 255);
 
 // Relay
 //  pinMode(A2, OUTPUT);
 //  digitalWrite(A2, LOW);
   
 }
+
+int packetnum = 0;
 
 // ------------ Main loop
 
@@ -181,89 +239,123 @@ void loop() {
       mpu.dmpGetAccel(&aa, fifoBuffer);
       mpu.dmpGetGravity(&gravity, &q);
       mpu.dmpGetLinearAccel(&aaReal, &aa, &gravity);
+      mpu.dmpGetLinearAccelInWorld(&aaWorld, &aaReal, &q); 
   }
   
-  // Check rocket has not surpassed apogee 
-  altitude = bme.readAltitude(SEALEVELPRESSURE_HPA);
-  if (altitude - lastAlt <= -1) {
-    delay(100);
-    altitude = bme.readAltitude(SEALEVELPRESSURE_HPA);
-    if (altitude - lastAlt <= -2) {
-      delay(100);
-      altitude = bme.readAltitude(SEALEVELPRESSURE_HPA);
-      if (altitude - lastAlt <= -3) {
-        apogee = lastAlt - 3;
-        delay(150);
-        deploy();
-      } else {
-      lastAlt = altitude;
-      }
-    } else {
-      lastAlt = altitude;
-      } 
-   } else {
-    lastAlt = altitude;
-   }
+//  // Check rocket has not surpassed apogee 
+//  altitude = bme.readAltitude(SEALEVELPRESSURE_HPA);
+//  if (altitude - lastAlt <= -1) {
+//    delay(100);
+//    altitude = bme.readAltitude(SEALEVELPRESSURE_HPA);
+//    if (altitude - lastAlt <= -2) {
+//      delay(100);
+//      altitude = bme.readAltitude(SEALEVELPRESSURE_HPA);
+//      if (altitude - lastAlt <= -3) {
+//        apogee = lastAlt - 3;
+//        delay(150);
+//        deploy();
+//      } else {
+//      lastAlt = altitude;
+//      }
+//    } else {
+//      lastAlt = altitude;
+//      } 
+//   } else {
+//    lastAlt = altitude;
+//   }
 
 
-   if (chutesFired == true) {
-    // BEGIN DESCENT // 
-        analogWrite(A0,150);
-        delay(100);
-        analogWrite(A0, 0);
-        delay(100);
-        analogWrite(A0,150);
-        delay(100);
-        analogWrite(A0, 0);
-        delay(100);
-        touchdown();
-   }
+//   if (chutesFired == true) {
+//    // BEGIN DESCENT // 
+//        analogWrite(A3,150);
+//        delay(100);
+//        analogWrite(A3, 0);
+//        delay(100);
+//        analogWrite(A3,150);
+//        delay(100);
+//        analogWrite(A3, 0);
+//        delay(100);
+//        touchdown();
+//   }
+
+    ypr[0] = ypr[0] * 180/M_PI;
+    ypr[1] = ypr[1] * 180/M_PI;
+    ypr[2] = ypr[2] * 180/M_PI;
   
 
-  // ------------ Convert collected data to JSON
-  String Payload = "{""\"Temperature\":";
-  Payload += bme.readTemperature();
-  Payload += ",""\"Pressure\":";
-  Payload += (bme.readPressure() / 100.0F);
-  Payload += ",""\"Altitude\":";
-  Payload += bme.readAltitude(SEALEVELPRESSURE_HPA);
-  Payload += ",""\"Humidity\":";
-  Payload += bme.readHumidity();
-  Payload += ",""\"Yaw\":";
-  Payload += ypr[0] * 180/M_PI;
-  Payload += ",""\"Pitch\":";
-  Payload += ypr[1] * 180/M_PI;
-  Payload += ",""\"Roll\":";
-  Payload += ypr[2] * 180/M_PI;
-  Payload += ",""\"X\":";
-  Payload += aaReal.x;
-  Payload += ",""\"Y\":";
-  Payload += aaReal.y;
-  Payload += ",""\"Z\":";
-  Payload += aaReal.z;
-  Payload += "}";
-  
-  char packet[200];
-  int i = 0;
-  int sizeOf = 200;
-  int offset = 0;
-  
-  while((i<sizeOf))
-  {
-     packet[i]=Payload[i];  
-     i++;
-  }
-  
-//  Udp.beginPacket(remoteIp, 2931);
-//  Udp.write(packet);
-//  Udp.endPacket();
+//  // ------------ Convert collected data to JSON
+//  String Payload = "";
+//  Payload += "{""\"Temperature\":"; 
+//  Payload += bme.readTemperature();
+//  Payload += ",""\"Pressure\":";
+//  Payload += (bme.readPressure() / 100.0F);
+//  Payload += ",""\"Altitude\":";
+//  Payload += bme.readAltitude(SEALEVELPRESSURE_HPA);
+//  Payload += ",""\"Humidity\":";
+//  Payload += bme.readHumidity();
+//  Payload += ",""\"Yaw\":";
+//  Payload += ypr[0];
+//  Payload += ",""\"Pitch\":";
+//  Payload += ypr[1];
+//  Payload += ",""\"Roll\":";
+//  Payload += ypr[2];
+//  Payload += ",""\"X\":";
+//  Payload += aaWorld.x;
+//  Payload += ",""\"Y\":";
+//  Payload += aaWorld.y;
+//  Payload += ",""\"Z\":";
+//  Payload += aaWorld.z;
+//  Payload += "}";
+
+//  Serial.print(ypr[0]);
+//  Serial.print("/");
+//  Serial.print(ypr[1]);
+//  Serial.print("/");
+//  Serial.println(ypr[2]);
+
+  // Send data over radio
+  char packet[100];
+
+  sprintf(packet, "%.2f/%.2f/%.2f/%.2f/%.2f/%.2f/%.2f/%d/%d/%d", bme.readTemperature(), (bme.readPressure() / 100.0F), bme.readAltitude(SEALEVELPRESSURE_HPA), bme.readHumidity(), ypr[0], ypr[1], ypr[2], aaWorld.x, aaWorld.y, aaWorld.z);
   Serial.println(packet);
-//  delay(100);
-  
-//  Udp.beginPacket(groundIp, 8888);
-//  Udp.write(flightData);
-//  Udp.endPacket();
-  delay(100);
+
+
+  int servo0Val = map(ypr[1], -90, 90, 0, 180);
+  int servo1Val = map(ypr[1], -90, 90, 0, 180);
+
+  servo0.write(servo0Val);
+  servo1.write(servo1Val);
+
+  packet[99] = 0;
+  // Send payload packet over radio
+  rf95.send((uint8_t *)packet, 100);
+  delay(10);
+  // Wait for packet completion
+//  rf95.waitPacketSent();
+////   Now wait for a reply
+//  uint8_t buf[RH_RF95_MAX_MESSAGE_LEN];
+//  uint8_t len = sizeof(buf);
+ 
+//  Serial.println("Waiting for reply...");
+//  if (rf95.waitAvailableTimeout(100))
+//  { 
+//    // Should be a reply message for us now   
+//    if (rf95.recv(buf, &len))
+//   {
+//      Serial.print("Got reply: ");
+//      Serial.println((char*)buf);
+////      Serial.print("RSSI: ");
+////      Serial.println(rf95.lastRssi(), DEC);    
+//    }
+//    else
+//    {
+//      Serial.println("Receive failed");
+//    }
+//  }
+//  else
+//  {
+//    Serial.println("No reply, is there a listener around?");
+//  }
 }
 
 
